@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Excel Stacker (header-based union)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  /* Minimal, functional only */
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+  fieldset { margin: 10px 0; }
+  table.preview { border-collapse: collapse; font-size: 12px; }
+  table.preview th, table.preview td { border: 1px solid #999; padding: 2px 6px; white-space: nowrap; }
+  table.preview th { background: #eee; }
+  .cols label { display: inline-block; margin-right: 14px; white-space: nowrap; }
+  .missing { color: #a00; }
+  .filerow { margin: 4px 0; }
+  #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; }
+  .muted { color: #555; }
+  button { padding: 4px 10px; }
+</style>
+</head>
+<body>
+
+<h2>Excel Stacker</h2>
+<p class="muted">Stacks multiple Excel/CSV files into one sheet. Rows are appended; columns are aligned by matching header text (not position). Missing columns become blank.</p>
+
+<fieldset>
+  <legend>1. Files</legend>
+  <input type="file" id="files" multiple accept=".xlsx,.xls,.xlsm,.csv">
+  <div id="fileList"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Options</legend>
+  <label>Header row: <input type="number" id="headerRow" value="1" min="1" style="width:60px"></label>
+  &nbsp;&nbsp;
+  <label><input type="checkbox" id="normalize" checked> Normalize headers (trim + case-insensitive when matching)</label>
+  &nbsp;&nbsp;
+  <label><input type="checkbox" id="addSource" checked> Add "Source File" column</label>
+</fieldset>
+
+<fieldset>
+  <legend>3. Columns to include</legend>
+  <div class="muted">Order = first appearance across files. Uncheck to drop a column.</div>
+  <div id="colList" class="cols">(load files first)</div>
+</fieldset>
+
+<fieldset>
+  <legend>4. Combine</legend>
+  <button id="combineBtn" disabled>Combine &amp; preview</button>
+  &nbsp;
+  <label>Output name: <input type="text" id="outName" value="combined.xlsx" style="width:180px"></label>
+  &nbsp;
+  <button id="downloadBtn" disabled>Download .xlsx</button>
+  <div id="summary" class="muted"></div>
+</fieldset>
+
+<div id="log"></div>
+
+<h3>Preview <span class="muted">(first 50 rows)</span></h3>
+<div id="preview"></div>
+
+<script>
+"use strict";
+
+let files = [];        // {name, wb, sheetNames, sheet}
+let columns = [];      // [{key, display}]
+let included = {};     // key -> bool
+let combined = null;   // {rows, total, colCount}
+
+const $ = id => document.getElementById(id);
+
+function log(msg) { $("log").textContent += msg + "\n"; }
+function clearLog() { $("log").textContent = ""; }
+
+function headerRowIdx() { return Math.max(0, (parseInt($("headerRow").value, 10) || 1) - 1); }
+function normalizeOn() { return $("normalize").checked; }
+function addSourceOn() { return $("addSource").checked; }
+
+function normKey(h) {
+  if (h === null || h === undefined) return "";
+  let s = String(h);
+  if (normalizeOn()) s = s.trim().toLowerCase();
+  return s;
+}
+
+function isEmptyHeader(h) {
+  return h === null || h === undefined || String(h).trim() === "";
+}
+
+// ---- File loading -----------------------------------------------------------
+$("files").addEventListener("change", async e => {
+  files = [];
+  clearLog();
+  const list = Array.from(e.target.files);
+  for (const file of list) {
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      files.push({ name: file.name, wb, sheetNames: wb.SheetNames, sheet: wb.SheetNames[0] });
+      log("Loaded: " + file.name + "  [sheets: " + wb.SheetNames.join(", ") + "]");
+    } catch (err) {
+      log("FAILED: " + file.name + " — " + err.message);
+    }
+  }
+  renderFileList();
+  rescan();
+});
+
+function renderFileList() {
+  const c = $("fileList");
+  c.innerHTML = "";
+  files.forEach((f, i) => {
+    const div = document.createElement("div");
+    div.className = "filerow";
+    const label = document.createElement("span");
+    label.textContent = f.name + "  —  sheet: ";
+    const sel = document.createElement("select");
+    f.sheetNames.forEach(sn => {
+      const o = document.createElement("option");
+      o.value = sn; o.textContent = sn;
+      if (sn === f.sheet) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", () => { files[i].sheet = sel.value; rescan(); });
+    div.appendChild(label);
+    div.appendChild(sel);
+    c.appendChild(div);
+  });
+}
+
+// ---- Header scan / column union --------------------------------------------
+function getAoA(f) {
+  const ws = f.wb.Sheets[f.sheet];
+  if (!ws) return [];
+  return XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+}
+
+function fileKeyIndex(aoa) {
+  const headers = aoa[headerRowIdx()] || [];
+  const idx = {};
+  headers.forEach((h, i) => {
+    if (isEmptyHeader(h)) return;
+    const k = normKey(h);
+    if (!(k in idx)) idx[k] = i; // first occurrence wins on duplicate headers
+  });
+  return idx;
+}
+
+function rescan() {
+  const prevIncluded = included;
+  const map = new Map();
+  const order = [];
+  files.forEach(f => {
+    const aoa = getAoA(f);
+    const headers = aoa[headerRowIdx()] || [];
+    headers.forEach(h => {
+      if (isEmptyHeader(h)) return;
+      const k = normKey(h);
+      if (!map.has(k)) {
+        const col = { key: k, display: String(h).trim() };
+        map.set(k, col);
+        order.push(col);
+      }
+    });
+  });
+  columns = order;
+
+  // preserve prior include choices where the key still exists
+  included = {};
+  columns.forEach(c => { included[c.key] = (c.key in prevIncluded) ? prevIncluded[c.key] : true; });
+
+  renderColumns();
+  combined = null;
+  $("downloadBtn").disabled = true;
+  $("combineBtn").disabled = files.length === 0;
+  $("preview").innerHTML = "";
+  $("summary").textContent = "";
+}
+
+function renderColumns() {
+  const c = $("colList");
+  c.innerHTML = "";
+  if (!columns.length) { c.textContent = "(no headers found — check the header row number)"; return; }
+
+  // per-file missing report
+  const perFileMissing = files.map(f => {
+    const idx = fileKeyIndex(getAoA(f));
+    const missing = columns.filter(col => !(col.key in idx)).map(col => col.display);
+    return { name: f.name, missing };
+  });
+
+  columns.forEach(col => {
+    const lbl = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = included[col.key];
+    cb.addEventListener("change", () => { included[col.key] = cb.checked; combined = null; $("downloadBtn").disabled = true; });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(" " + col.display));
+    c.appendChild(lbl);
+  });
+
+  const anyMissing = perFileMissing.some(f => f.missing.length);
+  if (anyMissing) {
+    const note = document.createElement("div");
+    note.className = "missing";
+    note.style.marginTop = "8px";
+    note.innerHTML = "<b>Columns missing per file</b> (blank in output — watch for header typos):<br>" +
+      perFileMissing.filter(f => f.missing.length)
+        .map(f => "&nbsp;&nbsp;" + f.name + ": " + f.missing.join(", "))
+        .join("<br>");
+    c.appendChild(note);
+  }
+}
+
+// ---- Combine ----------------------------------------------------------------
+function combine() {
+  const cols = columns.filter(c => included[c.key]);
+  const outHeaders = [];
+  if (addSourceOn()) outHeaders.push("Source File");
+  cols.forEach(c => outHeaders.push(c.display));
+
+  const rows = [outHeaders];
+  let total = 0;
+
+  files.forEach(f => {
+    const aoa = getAoA(f);
+    const idx = fileKeyIndex(aoa);
+    const dataRows = aoa.slice(headerRowIdx() + 1);
+    dataRows.forEach(dr => {
+      if (!dr || dr.every(v => v === null || v === undefined || v === "")) return; // skip empty
+      const out = [];
+      if (addSourceOn()) out.push(f.name);
+      cols.forEach(c => {
+        const i = idx[c.key];
+        out.push(i === undefined ? null : (dr[i] === undefined ? null : dr[i]));
+      });
+      rows.push(out);
+      total++;
+    });
+  });
+
+  return { rows, total, colCount: outHeaders.length };
+}
+
+$("combineBtn").addEventListener("click", () => {
+  if (typeof XLSX === "undefined") { log("XLSX library failed to load (network?)."); return; }
+  if (!files.length) return;
+  combined = combine();
+  $("summary").textContent =
+    "Files: " + files.length + "   Data rows: " + combined.total + "   Columns: " + combined.colCount;
+  renderPreview(combined.rows);
+  $("downloadBtn").disabled = combined.total === 0;
+});
+
+function fmtCell(v) {
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v);
+}
+
+function renderPreview(rows) {
+  const c = $("preview");
+  c.innerHTML = "";
+  const table = document.createElement("table");
+  table.className = "preview";
+  const show = rows.slice(0, 51); // header + 50
+  show.forEach((r, ri) => {
+    const tr = document.createElement("tr");
+    r.forEach(v => {
+      const cell = document.createElement(ri === 0 ? "th" : "td");
+      cell.textContent = fmtCell(v);
+      tr.appendChild(cell);
+    });
+    table.appendChild(tr);
+  });
+  c.appendChild(table);
+}
+
+// ---- Download ---------------------------------------------------------------
+$("downloadBtn").addEventListener("click", () => {
+  if (!combined || !combined.rows.length) return;
+  const ws = XLSX.utils.aoa_to_sheet(combined.rows, { cellDates: true });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Combined");
+  let name = ($("outName").value || "combined.xlsx").trim();
+  if (!/\.xlsx$/i.test(name)) name += ".xlsx";
+  XLSX.writeFile(wb, name);
+});
+
+// react to option changes
+["headerRow", "normalize", "addSource"].forEach(id =>
+  $(id).addEventListener("change", () => { if (files.length) rescan(); })
+);
+</script>
+
+</body>
+</html>
