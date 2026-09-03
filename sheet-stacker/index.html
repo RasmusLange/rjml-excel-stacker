@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheet stacker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1150px; margin: 1rem auto; padding: 0 1rem; line-height: 1.45; }
+  fieldset { margin-bottom: 1rem; }
+  table { border-collapse: collapse; font-size: 0.85rem; }
+  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; vertical-align: top; }
+  #preview th, #preview td { white-space: nowrap; }
+  .cols { column-width: 260px; }
+  label { display: block; }
+  .row { display: block; margin: 0.3rem 0; }
+  code { background: #eee; padding: 0 3px; }
+  .scroll { overflow-x: auto; }
+  .sheetline { margin: 0.15rem 0; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+
+<h1>Sheet stacker</h1>
+<p>Load a workbook, choose which sheets and which columns to keep, and get one stacked sheet back. Columns are matched by header text, so sheets can have their columns in different orders. Headers can sit anywhere in the sheet and can span several rows.</p>
+
+<fieldset>
+  <legend>1. Workbook</legend>
+  <input type="file" id="file" accept=".xlsx,.xlsm,.xls,.csv">
+</fieldset>
+
+<fieldset id="hdrBox" disabled>
+  <legend>2. Where the headers are</legend>
+  <p class="row">
+    <label><input type="radio" name="rowmode" value="auto" checked> Find the header block in each sheet automatically</label>
+    <label><input type="radio" name="rowmode" value="fixed"> Header rows
+      <input type="number" id="fixedFrom" value="1" min="1" step="1" style="width:5em"> to
+      <input type="number" id="fixedTo" value="4" min="1" step="1" style="width:5em">
+      in every sheet
+    </label>
+  </p>
+  <p class="row">
+    <label><input type="checkbox" id="spread" checked> Repeat a group label across the blank cells to its right, so <code>Standard Price</code> above four columns applies to all four</label>
+    <label><input type="checkbox" id="bottomOnly"> Name each column from the bottom header row only, ignoring the rows above it</label>
+    <label>Joiner between header row parts
+      <input type="text" id="sep" value=" " size="4">
+    </label>
+  </p>
+  <p class="row">
+    <label><input type="checkbox" id="looseMatch" checked> Match headers loosely: ignore case, leading/trailing and repeated spaces</label>
+    <label><input type="checkbox" id="skipBlank" checked> Skip rows where every kept column is empty</label>
+    <label><input type="checkbox" id="addSource" checked> Add a <code>Source sheet</code> column</label>
+    <label><input type="checkbox" id="addRowNo"> Add a <code>Source row</code> column</label>
+  </p>
+</fieldset>
+
+<fieldset id="sheetsBox" disabled>
+  <legend>3. Sheets to stack</legend>
+  <p>
+    <button type="button" id="allSheets">Select all</button>
+    <button type="button" id="noSheets">Select none</button>
+  </p>
+  <div id="sheets"></div>
+  <p><small>Per-sheet header rows: <code>auto</code>, a single row such as <code>4</code>, or a range such as <code>1-4</code>.</small></p>
+  <details id="hdrDetails">
+    <summary>Headers found in each sheet</summary>
+    <div id="hdrFound" class="scroll"></div>
+  </details>
+</fieldset>
+
+<fieldset id="headersBox" disabled>
+  <legend>4. Columns to keep</legend>
+  <p class="row">
+    <label><input type="radio" name="hmode" value="union" checked> Every header found in the selected sheets</label>
+    <label><input type="radio" name="hmode" value="common"> Only headers found in all selected sheets</label>
+    <label><input type="radio" name="hmode" value="custom"> The headers I list below, in this order</label>
+  </p>
+  <p class="row">
+    <textarea id="customHeaders" rows="6" cols="45" placeholder="One header per line" disabled></textarea>
+  </p>
+  <div id="headers" class="cols"></div>
+</fieldset>
+
+<p>
+  <button type="button" id="build" disabled>Stack sheets</button>
+  <button type="button" id="download" disabled>Download stacked.xlsx</button>
+</p>
+
+<div id="report"></div>
+<div id="preview" class="scroll"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let workbook = null;
+let sheets = {};     // name -> { aoa, selected, spec, block, headers, dupes, dataStart, dataRows }
+let result = null;
+
+const clean = v => String(v === null || v === undefined ? '' : v).replace(/\s+/g, ' ').trim();
+const isEmpty = v => v === null || v === undefined || String(v).trim() === '';
+const keyOf = v => $('looseMatch').checked ? clean(v).toLowerCase() : clean(v);
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+/* ---------------- loading ---------------- */
+
+$('file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  resetAll();
+  try {
+    const buf = await f.arrayBuffer();
+    workbook = XLSX.read(buf, { type: 'array', cellDates: true });
+  } catch (err) {
+    $('report').innerHTML = '<p>Could not read that file: ' + escapeHtml(err.message) + '</p>';
+    return;
+  }
+  readWorkbook();
+  computeAll();
+  renderSheets();
+  ['hdrBox','sheetsBox','headersBox'].forEach(i => $(i).disabled = false);
+  $('build').disabled = false;
+});
+
+function resetAll() {
+  sheets = {}; result = null;
+  $('sheets').innerHTML = ''; $('headers').innerHTML = '';
+  $('hdrFound').innerHTML = ''; $('report').innerHTML = ''; $('preview').innerHTML = '';
+  $('customHeaders').value = '';
+  $('download').disabled = true;
+}
+
+function readWorkbook() {
+  sheets = {};
+  workbook.SheetNames.forEach(name => {
+    const ws = workbook.Sheets[name];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true });
+    fillMerges(ws, aoa);
+    sheets[name] = { aoa, selected: true, spec: 'auto' };
+  });
+}
+
+// A merged cell only carries its value in the top-left cell. Copy it across the range
+// so group labels like "Standard Price" cover every column they span.
+function fillMerges(ws, aoa) {
+  (ws['!merges'] || []).forEach(m => {
+    const v = (aoa[m.s.r] || [])[m.s.c];
+    if (isEmpty(v)) return;
+    for (let r = m.s.r; r <= m.e.r; r++) {
+      if (!aoa[r]) aoa[r] = [];
+      for (let c = m.s.c; c <= m.e.c; c++) if (isEmpty(aoa[r][c])) aoa[r][c] = v;
+    }
+  });
+}
+
+/* ---------------- finding the header block ---------------- */
+
+function parseSpec(s) {
+  s = String(s || '').trim().toLowerCase();
+  if (!s || s === 'auto') return null;
+  let m = s.match(/^(\d+)\s*(?:-|:|to)\s*(\d+)$/);
+  if (m) {
+    let a = +m[1] - 1, b = +m[2] - 1;
+    return { start: Math.min(a, b), end: Math.max(a, b) };
+  }
+  m = s.match(/^(\d+)$/);
+  if (m) return { start: +m[1] - 1, end: +m[1] - 1 };
+  return null;
+}
+
+// Walk down until a row looks like data (well filled and carrying numbers or dates),
+// then treat the rows above it as the header block, stopping at a one-cell title row.
+function detectBlock(aoa) {
+  const scan = Math.min(aoa.length, 30);
+  const info = [];
+  let maxFilled = 0;
+  for (let r = 0; r < scan; r++) {
+    const row = aoa[r] || [];
+    let filled = 0, num = 0;
+    row.forEach(v => {
+      if (isEmpty(v)) return;
+      filled++;
+      if (typeof v === 'number' || v instanceof Date) num++;
+    });
+    info.push({ filled, num });
+    if (filled > maxFilled) maxFilled = filled;
+  }
+  let dataRow = -1;
+  for (let r = 1; r < scan; r++) {
+    const i = info[r];
+    if (i.filled >= Math.max(2, maxFilled * 0.5) && i.num > 0 && i.num / i.filled >= 0.25) { dataRow = r; break; }
+  }
+  if (dataRow < 1) {
+    let best = 0;
+    for (let r = 0; r < scan; r++) if (info[r].filled === maxFilled) { best = r; break; }
+    return { start: best, end: best, guessed: true };
+  }
+  const end = dataRow - 1;
+  let start = end;
+  while (start - 1 >= 0 && info[start - 1].filled >= 2) start--;
+  if (end - start > 7) start = end - 7;
+  return { start, end, guessed: false };
+}
+
+function resolveBlock(s) {
+  const own = parseSpec(s.spec);
+  if (own) return { ...own, source: 'set here' };
+  if (document.querySelector('input[name=rowmode]:checked').value === 'fixed') {
+    const a = Math.max(1, parseInt($('fixedFrom').value, 10) || 1) - 1;
+    const b = Math.max(1, parseInt($('fixedTo').value, 10) || 1) - 1;
+    return { start: Math.min(a, b), end: Math.max(a, b), source: 'fixed' };
+  }
+  const d = detectBlock(s.aoa);
+  return { ...d, source: d.guessed ? 'best guess' : 'found' };
+}
+
+/* ---------------- building header names ---------------- */
+
+function buildHeaders(aoa, start, end) {
+  const sep = $('sep').value;
+  const spread = $('spread').checked;
+  const bottomOnly = $('bottomOnly').checked;
+
+  const rows = [];
+  let maxCol = -1;
+  for (let r = start; r <= end; r++) {
+    const row = (aoa[r] || []).slice();
+    rows.push(row);
+    row.forEach((v, c) => { if (!isEmpty(v) && c > maxCol) maxCol = c; });
+  }
+  if (maxCol < 0) return { headers: [], dupes: [] };
+
+  if (spread) {
+    rows.forEach((row, i) => {
+      if (start + i === end) return;                                  // leave the bottom row alone
+      if (row.filter(v => !isEmpty(v)).length < 2) return;            // a lone cell is a title, not a group label
+      let last = null;
+      for (let c = 0; c <= maxCol; c++) {
+        if (!isEmpty(row[c])) last = row[c];
+        else if (last !== null) row[c] = last;
+      }
+    });
+  }
+
+  const headers = [], seen = new Set(), dupes = [];
+  for (let c = 0; c <= maxCol; c++) {
+    let text;
+    if (bottomOnly) {
+      text = clean(rows[rows.length - 1][c]);
+    } else {
+      const parts = [];
+      rows.forEach(row => {
+        const v = clean(row[c]);
+        if (v && v !== parts[parts.length - 1]) parts.push(v);
+      });
+      text = parts.join(sep).trim();
+    }
+    if (!text) continue;
+    const k = keyOf(text);
+    if (seen.has(k)) { dupes.push(text); continue; }                  // first column with that name wins
+    seen.add(k);
+    headers.push({ text, key: k, col: c });
+  }
+  return { headers, dupes };
+}
+
+function computeAll() {
+  Object.values(sheets).forEach(s => {
+    const b = resolveBlock(s);
+    const built = buildHeaders(s.aoa, b.start, b.end);
+    s.block = b;
+    s.headers = built.headers;
+    s.dupes = built.dupes;
+    s.dataStart = b.end + 1;
+    s.dataRows = Math.max(0, s.aoa.length - s.dataStart);
+  });
+}
+
+/* ---------------- sheet list ---------------- */
+
+function renderSheets() {
+  const box = $('sheets');
+  box.innerHTML = '';
+  Object.keys(sheets).forEach(name => {
+    const s = sheets[name];
+    const div = document.createElement('div');
+    div.className = 'sheetline';
+    div.innerHTML =
+      '<label><input type="checkbox" class="sheetChk" data-name="' + escapeHtml(name) + '"' +
+      (s.selected ? ' checked' : '') + '> ' + escapeHtml(name) +
+      ' header rows <input type="text" class="specIn" data-name="' + escapeHtml(name) + '" size="6" value="' +
+      escapeHtml(s.spec) + '"> ' +
+      '<small>' + describeBlock(s) + '</small></label>';
+    box.appendChild(div);
+  });
+  box.querySelectorAll('.sheetChk').forEach(c => c.addEventListener('change', e => {
+    sheets[e.target.dataset.name].selected = e.target.checked;
+    renderHeaders(); renderHeadersFound();
+  }));
+  box.querySelectorAll('.specIn').forEach(i => i.addEventListener('change', e => {
+    const s = sheets[e.target.dataset.name];
+    s.spec = e.target.value.trim() || 'auto';
+    computeAll(); renderSheets(); renderHeaders(); renderHeadersFound();
+  }));
+  renderHeaders();
+  renderHeadersFound();
+}
+
+function describeBlock(s) {
+  const b = s.block;
+  const rng = b.start === b.end ? ('row ' + (b.start + 1)) : ('rows ' + (b.start + 1) + '-' + (b.end + 1));
+  return '(' + b.source + ': ' + rng + ', ' + s.headers.length + ' columns, ' + s.dataRows + ' data rows)';
+}
+
+function renderHeadersFound() {
+  const names = selectedSheets();
+  if (!names.length) { $('hdrFound').innerHTML = '<p>No sheets selected.</p>'; return; }
+  let html = '<table><tr><th>Sheet</th><th>Header rows</th><th>Column names</th></tr>';
+  names.forEach(n => {
+    const s = sheets[n], b = s.block;
+    html += '<tr><td>' + escapeHtml(n) + '</td><td>' + (b.start + 1) + '-' + (b.end + 1) + '</td><td>' +
+      escapeHtml(s.headers.map(h => h.text).join('  |  ')) + '</td></tr>';
+  });
+  $('hdrFound').innerHTML = html + '</table>';
+}
+
+$('allSheets').addEventListener('click', () => { Object.values(sheets).forEach(s => s.selected = true); renderSheets(); });
+$('noSheets').addEventListener('click', () => { Object.values(sheets).forEach(s => s.selected = false); renderSheets(); });
+
+['fixedFrom','fixedTo','sep','spread','bottomOnly','looseMatch'].forEach(id =>
+  $(id).addEventListener('change', () => { if (workbook) { computeAll(); renderSheets(); } }));
+document.querySelectorAll('input[name=rowmode]').forEach(r =>
+  r.addEventListener('change', () => { if (workbook) { computeAll(); renderSheets(); } }));
+document.querySelectorAll('input[name=hmode]').forEach(r => r.addEventListener('change', renderHeaders));
+
+function selectedSheets() {
+  return Object.keys(sheets).filter(n => sheets[n].selected);
+}
+
+/* ---------------- column picker ---------------- */
+
+function renderHeaders() {
+  const names = selectedSheets();
+  const order = [], byKey = {};
+  names.forEach(n => sheets[n].headers.forEach(h => {
+    if (!byKey[h.key]) { byKey[h.key] = { text: h.text, count: 0 }; order.push(h.key); }
+    byKey[h.key].count++;
+  }));
+
+  const mode = document.querySelector('input[name=hmode]:checked').value;
+  $('customHeaders').disabled = mode !== 'custom';
+  $('headers').innerHTML = '';
+
+  if (mode === 'custom') {
+    if (!$('customHeaders').value.trim()) $('customHeaders').value = order.map(k => byKey[k].text).join('\n');
+    return;
+  }
+  order.forEach(k => {
+    const h = byKey[k];
+    const inAll = h.count === names.length;
+    const l = document.createElement('label');
+    l.innerHTML = '<input type="checkbox" class="hdrChk" data-key="' + escapeHtml(k) + '" value="' +
+      escapeHtml(h.text) + '"' + (mode === 'union' || inAll ? ' checked' : '') + '> ' +
+      escapeHtml(h.text) + ' <small>(' + h.count + '/' + names.length + ' sheets)</small>';
+    $('headers').appendChild(l);
+  });
+}
+
+function targetHeaders() {
+  const mode = document.querySelector('input[name=hmode]:checked').value;
+  if (mode === 'custom') {
+    const out = [], seen = new Set();
+    $('customHeaders').value.split('\n').map(clean).filter(Boolean).forEach(t => {
+      const k = keyOf(t);
+      if (!seen.has(k)) { seen.add(k); out.push({ text: t, key: k }); }
+    });
+    return out;
+  }
+  return [...$('headers').querySelectorAll('.hdrChk')].filter(c => c.checked)
+    .map(c => ({ text: c.value, key: c.dataset.key }));
+}
+
+/* ---------------- stacking ---------------- */
+
+$('build').addEventListener('click', () => {
+  const names = selectedSheets();
+  const targets = targetHeaders();
+  if (!names.length) { $('report').innerHTML = '<p>Select at least one sheet.</p>'; return; }
+  if (!targets.length) { $('report').innerHTML = '<p>Select at least one column.</p>'; return; }
+
+  const headerOut = targets.map(t => t.text);
+  if ($('addSource').checked) headerOut.push('Source sheet');
+  if ($('addRowNo').checked) headerOut.push('Source row');
+
+  const out = [], log = [];
+  const targetKeys = new Set(targets.map(t => t.key));
+
+  names.forEach(name => {
+    const s = sheets[name];
+    const map = {};
+    s.headers.forEach(h => { map[h.key] = h.col; });
+
+    const missing = targets.filter(t => map[t.key] === undefined).map(t => t.text);
+    const ignored = s.headers.filter(h => !targetKeys.has(h.key)).map(h => h.text);
+
+    let kept = 0, blank = 0;
+    for (let r = s.dataStart; r < s.aoa.length; r++) {
+      const src = s.aoa[r] || [];
+      const row = targets.map(t => {
+        const c = map[t.key];
+        return c === undefined || src[c] === undefined ? null : src[c];
+      });
+      if ($('skipBlank').checked && row.every(isEmpty)) { blank++; continue; }
+      if ($('addSource').checked) row.push(name);
+      if ($('addRowNo').checked) row.push(r + 1);
+      out.push(row);
+      kept++;
+    }
+    log.push({ name, block: s.block, kept, blank, matched: targets.length - missing.length, missing, ignored, dupes: s.dupes });
+  });
+
+  result = { headers: headerOut, rows: out };
+  $('download').disabled = out.length === 0;
+  renderReport(log, out.length, headerOut.length);
+  renderPreview(headerOut, out);
+});
+
+function renderReport(log, rows, cols) {
+  let html = '<h2>Result</h2><p>' + rows + ' rows and ' + cols + ' columns from ' + log.length + ' sheet(s).</p>';
+  html += '<div class="scroll"><table><tr><th>Sheet</th><th>Header rows</th><th>Rows kept</th><th>Blank rows skipped</th>' +
+          '<th>Columns matched</th><th>Columns missing (left empty)</th><th>Columns in sheet but not kept</th></tr>';
+  log.forEach(l => {
+    html += '<tr><td>' + escapeHtml(l.name) + '</td>' +
+      '<td>' + (l.block.start + 1) + '-' + (l.block.end + 1) + '</td>' +
+      '<td>' + l.kept + '</td><td>' + l.blank + '</td><td>' + l.matched + '</td>' +
+      '<td>' + (l.missing.length ? escapeHtml(l.missing.join(', ')) : '-') + '</td>' +
+      '<td>' + (l.ignored.length ? escapeHtml(l.ignored.join(', ')) : '-') + '</td></tr>';
+    if (l.dupes.length) {
+      html += '<tr><td colspan="7"><small>' + escapeHtml(l.name) +
+        ': repeated header names, first column used - ' + escapeHtml(l.dupes.join(', ')) + '</small></td></tr>';
+    }
+  });
+  $('report').innerHTML = html + '</table></div>';
+}
+
+function renderPreview(headers, rows) {
+  const n = Math.min(rows.length, 50);
+  let html = '<h2>Preview</h2><p>First ' + n + ' of ' + rows.length + ' rows.</p><table><tr>';
+  headers.forEach(h => html += '<th>' + escapeHtml(h) + '</th>');
+  html += '</tr>';
+  for (let i = 0; i < n; i++) {
+    html += '<tr>';
+    headers.forEach((h, j) => html += '<td>' + escapeHtml(fmt(rows[i][j])) + '</td>');
+    html += '</tr>';
+  }
+  $('preview').innerHTML = html + '</table>';
+}
+
+const fmt = v => v === null || v === undefined ? '' : (v instanceof Date ? v.toISOString().slice(0, 10) : String(v));
+
+$('download').addEventListener('click', () => {
+  if (!result) return;
+  const ws = XLSX.utils.aoa_to_sheet([result.headers, ...result.rows], { cellDates: true });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Stacked');
+  XLSX.writeFile(wb, 'stacked.xlsx');
+});
+</script>
+
+</body>
+</html>
