@@ -8,6 +8,7 @@
 <style>
   /* Minimal, functional only */
   body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+  .header-bar { display: flex; justify-content: space-between; align-items: center; }
   fieldset { margin: 10px 0; }
   table.preview { border-collapse: collapse; font-size: 12px; }
   table.preview th, table.preview td { border: 1px solid #999; padding: 2px 6px; white-space: nowrap; }
@@ -17,12 +18,15 @@
   .filerow { margin: 4px 0; }
   #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; }
   .muted { color: #555; }
-  button { padding: 4px 10px; }
+  button { padding: 4px 10px; cursor: pointer; }
 </style>
 </head>
 <body>
 
-<h2>Excel Stacker</h2>
+<div class="header-bar">
+  <h2>Excel Stacker</h2>
+  <a href="/sheet-stacker"><button>Stack sheets?</button></a>
+</div>
 <p class="muted">Stacks multiple Excel/CSV files into one sheet. Rows are appended; columns are aligned by matching header text (not position). Missing columns become blank.</p>
 
 <fieldset>
