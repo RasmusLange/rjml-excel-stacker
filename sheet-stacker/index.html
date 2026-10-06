@@ -82,6 +82,19 @@
   <div id="headers" class="cols"></div>
 </fieldset>
 
+<fieldset id="dedupeBox" disabled>
+  <legend>5. Duplicates</legend>
+  <p class="row">
+    <label><input type="radio" name="dedupe" value="none" checked> Keep all rows</label>
+    <label><input type="radio" name="dedupe" value="rows"> Remove identical rows (every kept column matches)</label>
+    <label><input type="radio" name="dedupe" value="column"> Remove rows with a repeated value in column
+      <select id="dedupeCol" disabled></select>
+    </label>
+    <label><input type="checkbox" id="dedupeLoose" checked> Ignore case and extra spaces when comparing values</label>
+  </p>
+  <p><small>The first occurrence is kept, in sheet order. <code>Source sheet</code> and <code>Source row</code> are never compared, so duplicates across sheets are caught. In column mode, rows with an empty value in that column are always kept.</small></p>
+</fieldset>
+
 <p>
   <button type="button" id="build" disabled>Stack sheets</button>
   <button type="button" id="download" disabled>Download stacked.xlsx</button>
@@ -118,7 +131,7 @@ $('file').addEventListener('change', async e => {
   readWorkbook();
   computeAll();
   renderSheets();
-  ['hdrBox','sheetsBox','headersBox'].forEach(i => $(i).disabled = false);
+  ['hdrBox','sheetsBox','headersBox','dedupeBox'].forEach(i => $(i).disabled = false);
   $('build').disabled = false;
 });
 
@@ -353,6 +366,7 @@ function renderHeaders() {
 
   if (mode === 'custom') {
     if (!$('customHeaders').value.trim()) $('customHeaders').value = order.map(k => byKey[k].text).join('\n');
+    renderDedupeCols();
     return;
   }
   order.forEach(k => {
@@ -364,6 +378,7 @@ function renderHeaders() {
       escapeHtml(h.text) + ' <small>(' + h.count + '/' + names.length + ' sheets)</small>';
     $('headers').appendChild(l);
   });
+  renderDedupeCols();
 }
 
 function targetHeaders() {
@@ -380,6 +395,40 @@ function targetHeaders() {
     .map(c => ({ text: c.value, key: c.dataset.key }));
 }
 
+/* ---------------- duplicates ---------------- */
+
+const dedupeMode = () => document.querySelector('input[name=dedupe]:checked').value;
+
+// Column choices = the columns currently set to be kept. Keep the previous choice when it still exists.
+function renderDedupeCols() {
+  const sel = $('dedupeCol');
+  const prevKey = sel.value;
+  const prevText = sel.selectedIndex >= 0 ? clean(sel.options[sel.selectedIndex].textContent).toLowerCase() : '';
+  sel.innerHTML = '';
+  const targets = targetHeaders();
+  let pick = targets.findIndex(t => t.key === prevKey);
+  if (pick < 0) pick = targets.findIndex(t => clean(t.text).toLowerCase() === prevText);
+  targets.forEach((t, i) => {
+    const o = document.createElement('option');
+    o.value = t.key; o.textContent = t.text;
+    if (i === pick) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.disabled = dedupeMode() !== 'column' || !targets.length;
+}
+
+// Comparable form of a cell value
+function cellKey(v) {
+  if (v === null || v === undefined) return '';
+  let s = v instanceof Date ? v.toISOString() : String(v);
+  if ($('dedupeLoose').checked) s = clean(s).toLowerCase();
+  return s;
+}
+
+$('headers').addEventListener('change', e => { if (e.target.classList.contains('hdrChk')) renderDedupeCols(); });
+$('customHeaders').addEventListener('input', renderDedupeCols);
+document.querySelectorAll('input[name=dedupe]').forEach(r => r.addEventListener('change', renderDedupeCols));
+
 /* ---------------- stacking ---------------- */
 
 $('build').addEventListener('click', () => {
@@ -395,6 +444,12 @@ $('build').addEventListener('click', () => {
   const out = [], log = [];
   const targetKeys = new Set(targets.map(t => t.key));
 
+  const dmode = dedupeMode();
+  const dcol = dmode === 'column' ? targets.findIndex(t => t.key === $('dedupeCol').value) : -1;
+  if (dmode === 'column' && dcol < 0) { $('report').innerHTML = '<p>Choose a column for the duplicate check.</p>'; return; }
+  const seen = new Set();
+  let dupesTotal = 0;
+
   names.forEach(name => {
     const s = sheets[name];
     const map = {};
@@ -403,7 +458,7 @@ $('build').addEventListener('click', () => {
     const missing = targets.filter(t => map[t.key] === undefined).map(t => t.text);
     const ignored = s.headers.filter(h => !targetKeys.has(h.key)).map(h => h.text);
 
-    let kept = 0, blank = 0;
+    let kept = 0, blank = 0, dupes = 0;
     for (let r = s.dataStart; r < s.aoa.length; r++) {
       const src = s.aoa[r] || [];
       const row = targets.map(t => {
@@ -411,32 +466,44 @@ $('build').addEventListener('click', () => {
         return c === undefined || src[c] === undefined ? null : src[c];
       });
       if ($('skipBlank').checked && row.every(isEmpty)) { blank++; continue; }
+
+      // duplicate check on kept columns only (source columns not added yet)
+      let k = null;
+      if (dmode === 'rows') k = JSON.stringify(row.map(cellKey));
+      else if (dcol >= 0) { k = cellKey(row[dcol]); if (k === '') k = null; }
+      if (k !== null) {
+        if (seen.has(k)) { dupes++; continue; }
+        seen.add(k);
+      }
+
       if ($('addSource').checked) row.push(name);
       if ($('addRowNo').checked) row.push(r + 1);
       out.push(row);
       kept++;
     }
-    log.push({ name, block: s.block, kept, blank, matched: targets.length - missing.length, missing, ignored, dupes: s.dupes });
+    dupesTotal += dupes;
+    log.push({ name, block: s.block, kept, blank, removed: dupes, matched: targets.length - missing.length, missing, ignored, dupes: s.dupes });
   });
 
   result = { headers: headerOut, rows: out };
   $('download').disabled = out.length === 0;
-  renderReport(log, out.length, headerOut.length);
+  renderReport(log, out.length, headerOut.length, dmode, dupesTotal);
   renderPreview(headerOut, out);
 });
 
-function renderReport(log, rows, cols) {
-  let html = '<h2>Result</h2><p>' + rows + ' rows and ' + cols + ' columns from ' + log.length + ' sheet(s).</p>';
+function renderReport(log, rows, cols, dmode, dupesTotal) {
+  let html = '<h2>Result</h2><p>' + rows + ' rows and ' + cols + ' columns from ' + log.length + ' sheet(s).' +
+    (dmode !== 'none' ? ' ' + dupesTotal + ' duplicate row(s) removed.' : '') + '</p>';
   html += '<div class="scroll"><table><tr><th>Sheet</th><th>Header rows</th><th>Rows kept</th><th>Blank rows skipped</th>' +
-          '<th>Columns matched</th><th>Columns missing (left empty)</th><th>Columns in sheet but not kept</th></tr>';
+          '<th>Duplicates removed</th><th>Columns matched</th><th>Columns missing (left empty)</th><th>Columns in sheet but not kept</th></tr>';
   log.forEach(l => {
     html += '<tr><td>' + escapeHtml(l.name) + '</td>' +
       '<td>' + (l.block.start + 1) + '-' + (l.block.end + 1) + '</td>' +
-      '<td>' + l.kept + '</td><td>' + l.blank + '</td><td>' + l.matched + '</td>' +
+      '<td>' + l.kept + '</td><td>' + l.blank + '</td><td>' + (dmode !== 'none' ? l.removed : '-') + '</td><td>' + l.matched + '</td>' +
       '<td>' + (l.missing.length ? escapeHtml(l.missing.join(', ')) : '-') + '</td>' +
       '<td>' + (l.ignored.length ? escapeHtml(l.ignored.join(', ')) : '-') + '</td></tr>';
     if (l.dupes.length) {
-      html += '<tr><td colspan="7"><small>' + escapeHtml(l.name) +
+      html += '<tr><td colspan="8"><small>' + escapeHtml(l.name) +
         ': repeated header names, first column used - ' + escapeHtml(l.dupes.join(', ')) + '</small></td></tr>';
     }
   });

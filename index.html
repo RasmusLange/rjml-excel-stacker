@@ -51,7 +51,17 @@
 </fieldset>
 
 <fieldset>
-  <legend>4. Combine</legend>
+  <legend>4. Duplicates</legend>
+  <label><input type="radio" name="dedupe" value="none" checked> Keep all rows</label><br>
+  <label><input type="radio" name="dedupe" value="rows"> Remove identical rows (every included column matches)</label><br>
+  <label><input type="radio" name="dedupe" value="column"> Remove rows with a repeated value in column</label>
+  <select id="dedupeCol" disabled></select><br>
+  <label><input type="checkbox" id="dedupeLoose" checked> Ignore case and extra spaces when comparing values</label>
+  <div class="muted">The first occurrence is kept (in file order). The "Source File" column is never compared, so duplicates across files are caught. In column mode, rows with an empty value in that column are always kept.</div>
+</fieldset>
+
+<fieldset>
+  <legend>5. Combine</legend>
   <button id="combineBtn" disabled>Combine &amp; preview</button>
   &nbsp;
   <label>Output name: <input type="text" id="outName" value="combined.xlsx" style="width:180px"></label>
@@ -200,11 +210,13 @@ function renderColumns() {
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = included[col.key];
-    cb.addEventListener("change", () => { included[col.key] = cb.checked; combined = null; $("downloadBtn").disabled = true; });
+    cb.addEventListener("change", () => { included[col.key] = cb.checked; invalidate(); renderDedupeCols(); });
     lbl.appendChild(cb);
     lbl.appendChild(document.createTextNode(" " + col.display));
     c.appendChild(lbl);
   });
+
+  renderDedupeCols();
 
   const anyMissing = perFileMissing.some(f => f.missing.length);
   if (anyMissing) {
@@ -219,6 +231,32 @@ function renderColumns() {
   }
 }
 
+// ---- Duplicates -------------------------------------------------------------
+function invalidate() { combined = null; $("downloadBtn").disabled = true; }
+function dedupeMode() { return document.querySelector('input[name="dedupe"]:checked').value; }
+
+// Column choices = currently included columns. Keep the previous choice if still available.
+function renderDedupeCols() {
+  const sel = $("dedupeCol");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  columns.filter(c => included[c.key]).forEach(c => {
+    const o = document.createElement("option");
+    o.value = c.key; o.textContent = c.display;
+    if (c.key === prev) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.disabled = dedupeMode() !== "column" || !sel.options.length;
+}
+
+// Comparable form of a cell value
+function cellKey(v) {
+  if (v === null || v === undefined) return "";
+  let s = v instanceof Date ? v.toISOString() : String(v);
+  if ($("dedupeLoose").checked) s = s.replace(/\s+/g, " ").trim().toLowerCase();
+  return s;
+}
+
 // ---- Combine ----------------------------------------------------------------
 function combine() {
   const cols = columns.filter(c => included[c.key]);
@@ -227,7 +265,12 @@ function combine() {
   cols.forEach(c => outHeaders.push(c.display));
 
   const rows = [outHeaders];
-  let total = 0;
+  let total = 0, dupes = 0;
+
+  const mode = dedupeMode();
+  const dcol = mode === "column" ? cols.findIndex(c => c.key === $("dedupeCol").value) : -1;
+  if (mode === "column" && dcol < 0) log("Duplicate check skipped: no column selected.");
+  const seen = new Set();
 
   files.forEach(f => {
     const aoa = getAoA(f);
@@ -235,18 +278,26 @@ function combine() {
     const dataRows = aoa.slice(headerRowIdx() + 1);
     dataRows.forEach(dr => {
       if (!dr || dr.every(v => v === null || v === undefined || v === "")) return; // skip empty
-      const out = [];
-      if (addSourceOn()) out.push(f.name);
-      cols.forEach(c => {
+      const data = cols.map(c => {
         const i = idx[c.key];
-        out.push(i === undefined ? null : (dr[i] === undefined ? null : dr[i]));
+        return i === undefined ? null : (dr[i] === undefined ? null : dr[i]);
       });
-      rows.push(out);
+
+      // duplicate check on data columns only (Source File excluded)
+      let k = null;
+      if (mode === "rows") k = JSON.stringify(data.map(cellKey));
+      else if (dcol >= 0) { k = cellKey(data[dcol]); if (k === "") k = null; }
+      if (k !== null) {
+        if (seen.has(k)) { dupes++; return; }
+        seen.add(k);
+      }
+
+      rows.push(addSourceOn() ? [f.name, ...data] : data);
       total++;
     });
   });
 
-  return { rows, total, colCount: outHeaders.length };
+  return { rows, total, dupes, colCount: outHeaders.length };
 }
 
 $("combineBtn").addEventListener("click", () => {
@@ -254,7 +305,8 @@ $("combineBtn").addEventListener("click", () => {
   if (!files.length) return;
   combined = combine();
   $("summary").textContent =
-    "Files: " + files.length + "   Data rows: " + combined.total + "   Columns: " + combined.colCount;
+    "Files: " + files.length + "   Data rows: " + combined.total + "   Columns: " + combined.colCount +
+    (dedupeMode() !== "none" ? "   Duplicates removed: " + combined.dupes : "");
   renderPreview(combined.rows);
   $("downloadBtn").disabled = combined.total === 0;
 });
@@ -298,6 +350,10 @@ $("downloadBtn").addEventListener("click", () => {
 ["headerRow", "normalize", "addSource"].forEach(id =>
   $(id).addEventListener("change", () => { if (files.length) rescan(); })
 );
+document.querySelectorAll('input[name="dedupe"]').forEach(r =>
+  r.addEventListener("change", () => { renderDedupeCols(); invalidate(); })
+);
+["dedupeCol", "dedupeLoose"].forEach(id => $(id).addEventListener("change", invalidate));
 </script>
 
 </body>
