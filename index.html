@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Excel Stacker (header-based union)</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   /* Minimal, functional only */
   body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; }
   .header-bar { display: flex; justify-content: space-between; align-items: center; }
   fieldset { margin: 10px 0; }
+  fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
   table.preview { border-collapse: collapse; font-size: 12px; }
   table.preview th, table.preview td { border: 1px solid #999; padding: 2px 6px; white-space: nowrap; }
   table.preview th { background: #eee; }
@@ -17,6 +17,7 @@
   .missing { color: #a00; }
   .filerow { margin: 4px 0; }
   #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; }
+  #status { font-weight: bold; min-height: 1.2em; }
   .muted { color: #555; }
   button { padding: 4px 10px; cursor: pointer; }
 </style>
@@ -28,6 +29,8 @@
   <a href="/sheet-stacker"><button>Stack sheets?</button></a>
 </div>
 <p class="muted">Stacks multiple Excel/CSV files into one sheet. Rows are appended; columns are aligned by matching header text (not position). Missing columns become blank.</p>
+
+<fieldset id="controls" class="plain">
 
 <fieldset>
   <legend>1. Files</legend>
@@ -70,18 +73,567 @@
   <div id="summary" class="muted"></div>
 </fieldset>
 
+</fieldset>
+
+<div id="status"></div>
 <div id="log"></div>
 
 <h3>Preview <span class="muted">(first 50 rows)</span></h3>
 <div id="preview"></div>
 
+<!-- Heavy lifting (reading, stacking, writing) runs in a background worker built from this block. -->
+<script type="text/plain" id="engineSrc">
+/* ---------- shared engine: runs inside a Web Worker (or in the page as a fallback) ---------- */
+/* `post(message, transfer)` is provided by the host. Page-specific handlers go in `handlers`. */
+
+const handlers = {
+  ping: () => XLSX.version,
+  sheetNames: m => XLSX.read(m.buf, { type: 'array', bookSheets: true }).SheetNames
+};
+
+// Parse workers hand their rows to the main worker over a MessageChannel port.
+function sendOverPort(port, make) {
+  let data;
+  try { data = make(); }
+  catch (err) { port.postMessage({ error: (err && err.message) || String(err) }); throw err; }
+  port.postMessage(data);
+  return data;
+}
+function receiveFromPort(port) {
+  return new Promise((resolve, reject) => {
+    port.onmessage = e => {
+      port.close();
+      if (e.data && e.data.error) reject(new Error(e.data.error)); else resolve(e.data);
+    };
+  });
+}
+
+async function handle(msg) {
+  const id = msg.id;
+  let last = 0;
+  const progress = text => {
+    const now = Date.now();
+    if (now - last < 150) return;
+    last = now;
+    post({ id, type: 'progress', text });
+  };
+  try {
+    const result = await handlers[msg.cmd](msg, progress);
+    post({ id, type: 'done', result });
+  } catch (err) {
+    post({ id, type: 'error', message: (err && err.message) || String(err) });
+  }
+}
+
+// Dense mode + no formatted text roughly halves parse time and memory.
+const READ_OPTS = { type: 'array', dense: true, cellDates: true, cellText: false, cellHTML: false, cellNF: false };
+
+const fmtN = n => n.toLocaleString('en-US');
+
+function cellValue(cell) {
+  if (cell === null || cell === undefined || cell.t === 'z' || cell.t === 'e') return null;
+  return cell.v === undefined ? null : cell.v;
+}
+
+function rowIsBlank(row) {
+  if (!row) return true;
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    if (v !== null && v !== undefined && v !== '') return false;
+  }
+  return true;
+}
+
+// Whole sheet as rows of plain values, anchored at A1 so row/column numbers match Excel.
+// Trailing blank rows (e.g. formatting down to row 1,048,576) are dropped.
+function sheetToAoA(ws) {
+  if (!ws) return [];
+  let out;
+  if (Array.isArray(ws)) {
+    out = new Array(ws.length);
+    for (let r = 0; r < ws.length; r++) {
+      const row = ws[r];
+      if (!row) { out[r] = []; continue; }
+      const a = new Array(row.length);
+      for (let c = 0; c < row.length; c++) a[c] = cellValue(row[c]);
+      out[r] = a;
+    }
+  } else {
+    if (!ws['!ref']) return [];
+    const rg = XLSX.utils.decode_range(ws['!ref']);
+    rg.s.r = 0; rg.s.c = 0;
+    out = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true, range: rg });
+  }
+  let n = out.length;
+  while (n > 0 && rowIsBlank(out[n - 1])) n--;
+  out.length = n;
+  return out;
+}
+
+/* ---------- duplicates ---------- */
+
+function makeKeyFn(loose) {
+  if (loose) return v =>
+    v === null || v === undefined ? '' :
+    typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().toLowerCase() :
+    v instanceof Date ? '\u0002' + v.getTime() : String(v);
+  return v =>
+    v === null || v === undefined ? '' :
+    v instanceof Date ? '\u0002' + v.getTime() : String(v);
+}
+
+// Returns a function row -> true when the row is a duplicate (and should be dropped), or null when off.
+function makeDeduper(mode, col, loose) {
+  if (mode !== 'rows' && mode !== 'column') return null;
+  const key = makeKeyFn(loose), seen = new Set();
+  if (mode === 'rows') return row => {
+    let k = '';
+    for (let i = 0; i < row.length; i++) k += key(row[i]) + '\u0001';
+    if (seen.has(k)) return true;
+    seen.add(k);
+    return false;
+  };
+  return row => {
+    const k = key(row[col]);
+    if (k === '') return false;              // empty values are never treated as duplicates
+    if (seen.has(k)) return true;
+    seen.add(k);
+    return false;
+  };
+}
+
+/* ---------- streaming .xlsx writer ---------- */
+/* Writes sheet XML in chunks through the browser's deflate (CompressionStream), so even
+   very large results never exist as one giant string or as millions of cell objects. */
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(buf, crc) {
+  crc = ~crc;
+  for (let i = 0; i < buf.length; i++) crc = CRC_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return ~crc;
+}
+
+class ZipWriter {
+  constructor() { this.parts = []; this.offset = 0; this.entries = []; this.enc = new TextEncoder(); }
+  _push(u8) { this.parts.push(u8); this.offset += u8.length; }
+
+  // producer(write) calls `await write(string)` as many times as it likes
+  async add(name, producer) {
+    const enc = this.enc, comp = [];
+    let crc = 0, usize = 0, csize = 0, method = 0, writer = null, reading = null;
+    if (typeof CompressionStream !== 'undefined') {
+      method = 8;
+      const cs = new CompressionStream('deflate-raw');
+      writer = cs.writable.getWriter();
+      const reader = cs.readable.getReader();
+      reading = (async () => {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          comp.push(value); csize += value.length;
+        }
+      })();
+    }
+    const write = async s => {
+      const u8 = enc.encode(s);
+      crc = crc32(u8, crc); usize += u8.length;
+      if (writer) await writer.write(u8);
+      else { comp.push(u8); csize += u8.length; }
+    };
+    await producer(write);
+    if (writer) { await writer.close(); await reading; }
+
+    const nameBytes = enc.encode(name);
+    const d = new Date();
+    const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    const e = { nameBytes, crc: crc >>> 0, csize, usize, method, dosTime, dosDate, offset: this.offset };
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+    h.setUint16(8, method, true); h.setUint16(10, dosTime, true); h.setUint16(12, dosDate, true);
+    h.setUint32(14, e.crc, true); h.setUint32(18, csize, true); h.setUint32(22, usize, true);
+    h.setUint16(26, nameBytes.length, true); h.setUint16(28, 0, true);
+    this._push(new Uint8Array(h.buffer)); this._push(nameBytes);
+    comp.forEach(c => this._push(c));
+    this.entries.push(e);
+  }
+
+  blob(type) {
+    const start = this.offset;
+    this.entries.forEach(e => {
+      const h = new DataView(new ArrayBuffer(46));
+      h.setUint32(0, 0x02014b50, true); h.setUint16(4, 20, true); h.setUint16(6, 20, true);
+      h.setUint16(8, 0x0800, true); h.setUint16(10, e.method, true);
+      h.setUint16(12, e.dosTime, true); h.setUint16(14, e.dosDate, true);
+      h.setUint32(16, e.crc, true); h.setUint32(20, e.csize, true); h.setUint32(24, e.usize, true);
+      h.setUint16(28, e.nameBytes.length, true);
+      h.setUint32(42, e.offset, true);
+      this._push(new Uint8Array(h.buffer)); this._push(e.nameBytes);
+    });
+    const size = this.offset - start;
+    const z = new DataView(new ArrayBuffer(22));
+    z.setUint32(0, 0x06054b50, true);
+    z.setUint16(8, this.entries.length, true); z.setUint16(10, this.entries.length, true);
+    z.setUint32(12, size, true); z.setUint32(16, start, true);
+    this._push(new Uint8Array(z.buffer));
+    return new Blob(this.parts, { type });
+  }
+}
+
+const NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+const XML_BAD = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g;
+const XML_NEEDS = /[&<>"\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/;
+const xmlText = s => !XML_NEEDS.test(s) ? s :
+  s.replace(XML_BAD, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Same conversion SheetJS uses when reading (so dates round-trip exactly, DST included)
+// (the 1899 base values are computed once: looking up historic time zones per cell is slow)
+const BASEDATE = new Date(1899, 11, 30, 0, 0, 0);
+const BASE_MS = BASEDATE.getTime(), BASE_OFFSET = BASEDATE.getTimezoneOffset();
+function dateSerial(d) {
+  return (d.getTime() - (BASE_MS + (d.getTimezoneOffset() - BASE_OFFSET) * 60000)) / 86400000;
+}
+const isWs = ch => ch === 32 || ch === 9 || ch === 10 || ch === 13;
+
+function colLetters(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    let s = '', x = i + 1;
+    while (x > 0) { const m = (x - 1) % 26; s = String.fromCharCode(65 + m) + s; x = Math.floor((x - 1) / 26); }
+    out.push(s);
+  }
+  return out;
+}
+
+function rowXml(row, r, L) {
+  let s = '<row r="' + r + '">';
+  for (let c = 0; c < row.length; c++) {
+    const v = row[c];
+    if (v === null || v === undefined || v === '') continue;
+    const ref = L[c] + r;
+    if (typeof v === 'number') {
+      if (isFinite(v)) { s += '<c r="' + ref + '"><v>' + v + '</v></c>'; continue; }
+    } else if (typeof v === 'boolean') {
+      s += '<c r="' + ref + '" t="b"><v>' + (v ? 1 : 0) + '</v></c>'; continue;
+    } else if (v instanceof Date) {
+      const n = dateSerial(v);
+      if (isFinite(n)) {
+        const whole = Math.abs(n - Math.round(n)) < 1e-8;
+        s += '<c r="' + ref + '" s="' + (whole ? 1 : 2) + '"><v>' + (whole ? Math.round(n) : n) + '</v></c>';
+      }
+      continue;
+    }
+    let t = String(v);
+    if (t.length > 32767) t = t.slice(0, 32767);
+    const keepWs = isWs(t.charCodeAt(0)) || isWs(t.charCodeAt(t.length - 1));
+    s += '<c r="' + ref + '" t="inlineStr"><is><t' + (keepWs ? ' xml:space="preserve"' : '') + '>' +
+         xmlText(t) + '</t></is></c>';
+  }
+  return s + '</row>';
+}
+
+const EXCEL_MAX_DATA_ROWS = 1048575;   // 1,048,576 rows per sheet minus the header row
+
+function safeSheetName(s) {
+  s = String(s || 'Sheet').replace(/[\[\]:*?\/\\]/g, ' ').trim().slice(0, 31);
+  return s || 'Sheet';
+}
+
+// headers: array, rows: array of arrays. Splits across sheets when over Excel's row limit.
+async function writeXlsx(headers, rows, sheetName, progress) {
+  const zip = new ZipWriter();
+  const nSheets = Math.max(1, Math.ceil(rows.length / EXCEL_MAX_DATA_ROWS));
+  const base = safeSheetName(sheetName);
+  const names = [];
+  for (let s = 0; s < nSheets; s++) names.push(s === 0 ? base : base.slice(0, 26) + ' (' + (s + 1) + ')');
+  const L = colLetters(Math.max(headers.length, 1));
+
+  for (let s = 0; s < nSheets; s++) {
+    const from = s * EXCEL_MAX_DATA_ROWS, to = Math.min(rows.length, from + EXCEL_MAX_DATA_ROWS);
+    await zip.add('xl/worksheets/sheet' + (s + 1) + '.xml', async write => {
+      await write(XML_HEAD + '<worksheet xmlns="' + NS_MAIN + '" xmlns:r="' + NS_REL + '">' +
+        '<sheetData>' + rowXml(headers, 1, L));
+      let chunk = '', n = 0;
+      for (let i = from; i < to; i++) {
+        chunk += rowXml(rows[i], i - from + 2, L);
+        if (++n === 2000) {
+          await write(chunk); chunk = ''; n = 0;
+          progress('Writing row ' + fmtN(i + 1) + ' of ' + fmtN(rows.length));
+        }
+      }
+      await write(chunk + '</sheetData></worksheet>');
+    });
+  }
+
+  progress('Finishing file');
+  const small = (name, xml) => zip.add(name, w => w(XML_HEAD + xml));
+  await small('[Content_Types].xml',
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+    names.map((_, i) => '<Override PartName="/xl/worksheets/sheet' + (i + 1) +
+      '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>').join('') +
+    '</Types>');
+  await small('_rels/.rels',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="' + NS_REL + '/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+  await small('xl/workbook.xml',
+    '<workbook xmlns="' + NS_MAIN + '" xmlns:r="' + NS_REL + '"><sheets>' +
+    names.map((n, i) => '<sheet name="' + xmlText(n) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>').join('') +
+    '</sheets></workbook>');
+  await small('xl/_rels/workbook.xml.rels',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    names.map((_, i) => '<Relationship Id="rId' + (i + 1) + '" Type="' + NS_REL +
+      '/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>').join('') +
+    '<Relationship Id="rId' + (names.length + 1) + '" Type="' + NS_REL + '/styles" Target="styles.xml"/></Relationships>');
+  await small('xl/styles.xml',
+    '<styleSheet xmlns="' + NS_MAIN + '">' +
+    '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>' +
+    '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+    '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+    '<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
+    '<xf numFmtId="22" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>' +
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>');
+
+  return zip.blob('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+}
+
+/* ---------- Excel Stacker handlers ---------- */
+let files = [];        // index -> { name, sheet, rows }  rows = non-blank rows of the selected sheet
+let combined = null;   // { headers, rows }
+
+handlers.reset = () => { files = []; combined = null; };
+
+// Parse one sheet of a file (only that sheet; the first one when none is given) and keep its
+// non-blank rows. Run by a pool worker, which sends the rows to the main worker over `port`,
+// or by the main worker itself (no port), which keeps them.
+handlers.parseFile = (m, progress) => {
+  progress('Reading ' + m.name);
+  const make = () => {
+    const wb = XLSX.read(m.buf, Object.assign({ sheets: m.sheet == null ? 0 : m.sheet }, READ_OPTS));
+    const sheet = m.sheet != null && wb.Sheets[m.sheet] ? m.sheet : wb.SheetNames[0];
+    return { sheetNames: wb.SheetNames, sheet, rows: sheetToAoA(wb.Sheets[sheet]).filter(r => !rowIsBlank(r)) };
+  };
+  const d = m.port ? sendOverPort(m.port, make) : make();
+  if (!m.port) { files[m.index] = { name: m.name, sheet: d.sheet, rows: d.rows }; combined = null; }
+  return { sheetNames: d.sheetNames, sheet: d.sheet, rowCount: d.rows.length };
+};
+
+// Main worker: take over the rows a pool worker parsed.
+handlers.receiveFile = async m => {
+  const d = await receiveFromPort(m.port);
+  files[m.index] = { name: m.name, sheet: d.sheet, rows: d.rows };
+  combined = null;
+  return d.rows.length;
+};
+
+handlers.headers = m => files.map(f => (f.rows && f.rows[m.headerIdx]) || []);
+
+handlers.combine = (m, progress) => {
+  combined = null;
+  const isDup = makeDeduper(m.dedupe.mode, m.dedupe.col, m.dedupe.loose);
+  const out = [];
+  let dupes = 0;
+  m.plans.forEach((map, fi) => {
+    const f = files[fi], rows = f.rows || [], w = map.length;
+    for (let r = m.headerIdx + 1; r < rows.length; r++) {
+      const dr = rows[r];
+      const data = new Array(w);
+      for (let j = 0; j < w; j++) {
+        const i = map[j], v = i < 0 ? null : dr[i];
+        data[j] = v === undefined ? null : v;
+      }
+      if (isDup && isDup(data)) { dupes++; continue; }
+      out.push(m.addSource ? [f.name].concat(data) : data);
+      if ((r & 8191) === 0) progress('Stacking ' + f.name + ': row ' + fmtN(r) + ' of ' + fmtN(rows.length));
+    }
+  });
+  combined = { headers: m.outHeaders, rows: out };
+  return { total: out.length, dupes, preview: out.slice(0, 50) };
+};
+
+handlers.download = (m, progress) => {
+  if (!combined) throw new Error('Nothing to download - combine first.');
+  return writeXlsx(combined.headers, combined.rows, 'Combined', progress);
+};
+</script>
+
 <script>
 "use strict";
+/* ---------- engine client: runs the code in #engineSrc in background workers ---------- */
+/* `engine` is the main worker that holds the data. Parsing is spread over a small pool of
+   extra workers (one per CPU core, max 4) that hand their rows straight to the main worker. */
+const XLSX_URL = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+const EXCEL_MAX_DATA_ROWS = 1048575;
 
-let files = [];        // {name, wb, sheetNames, sheet}
+const engine = (() => {
+  const src = document.getElementById("engineSrc").textContent;
+  const POOL = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1));   // spare cores
+  let blobUrl = null, mode = null, workerError = null;
+
+  // One request/response channel to a worker (or to an in-page copy of the engine)
+  function makeClient(send, terminate) {
+    const pending = new Map();
+    let seq = 0;
+    return {
+      receive(m) {
+        const p = pending.get(m.id);
+        if (!p) return;
+        if (m.type === "progress") { if (p.onProgress) p.onProgress(m.text); return; }
+        pending.delete(m.id);
+        if (m.type === "done") p.resolve(m.result); else p.reject(new Error(m.message));
+      },
+      failAll(msg) { pending.forEach(p => p.reject(new Error(msg))); pending.clear(); },
+      call(cmd, data, onProgress, transfer) {
+        const id = ++seq;
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject, onProgress });
+          send(Object.assign({ id, cmd }, data || {}), transfer);
+        });
+      },
+      terminate
+    };
+  }
+
+  function spawnWorker() {
+    if (!blobUrl) {
+      const code = "importScripts(" + JSON.stringify(XLSX_URL) + ");\n" +
+        "const post = (m, t) => self.postMessage(m, t || []);\n" + src +
+        "\nself.onmessage = e => handle(e.data);";
+      blobUrl = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+    }
+    const w = new Worker(blobUrl);
+    const c = makeClient((m, t) => w.postMessage(m, t || []), () => w.terminate());
+    w.onmessage = e => c.receive(e.data);
+    w.onerror = e => { e.preventDefault(); c.failAll("A background worker stopped" + (e.message ? ": " + e.message : " (out of memory?)")); };
+    return c.call("ping").then(() => c, err => { w.terminate(); throw err; });
+  }
+
+  // Fallback when workers are unavailable: same code on the page (works, but the page is busy while it runs)
+  let libLoading = null;
+  function spawnPage() {
+    if (!libLoading) libLoading = typeof XLSX !== "undefined" ? Promise.resolve() : new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = XLSX_URL;
+      s.onload = resolve;
+      s.onerror = () => { libLoading = null; reject(new Error("Could not load the Excel library (network?).")); };
+      document.head.appendChild(s);
+    });
+    return libLoading.then(() => {
+      let c;
+      const handle = new Function("post", src + "\nreturn handle;")(m => setTimeout(() => c.receive(m), 0));
+      c = makeClient(m => setTimeout(() => handle(m), 0), () => {});
+      return c;
+    });
+  }
+
+  async function spawn() {
+    if (mode !== "page") {
+      try { const c = await spawnWorker(); mode = "worker"; return c; }
+      catch (err) { mode = "page"; workerError = err.message; }
+    }
+    return spawnPage();
+  }
+
+  let main = spawn();
+  const api = {
+    get mode() { return mode; },
+    get workerError() { return workerError; },
+    async call(cmd, data, onProgress, transfer) {
+      const c = await main.catch(err => { main = spawn(); throw err; });
+      return c.call(cmd, data, onProgress, transfer);
+    },
+    // Runs job(client) for each job on a pool of fresh workers, which are closed afterwards.
+    // With one job or too few CPU cores the jobs run one by one with client = null, meaning
+    // "do it in the main worker" (handing rows between workers only pays off in parallel).
+    async parallel(jobs) {
+      await main.catch(() => {});
+      if (!this.usePool(jobs.length)) {
+        const results = [];
+        for (const job of jobs) results.push(await job(null));
+        return results;
+      }
+      const n = Math.min(POOL, jobs.length);
+      const clients = [];
+      try {
+        for (let i = 0; i < n; i++) clients.push(await spawn());
+        const results = new Array(jobs.length);
+        let next = 0;
+        await Promise.all(clients.map(async c => {
+          while (next < jobs.length) { const i = next++; results[i] = await jobs[i](c); }
+        }));
+        return results;
+      } finally {
+        clients.forEach(c => c.terminate());
+      }
+    },
+    poolSize: POOL,
+    usePool: jobCount => POOL >= 2 && jobCount >= 2
+  };
+  return api;
+})();
+
+/* ---------- busy state + status line ---------- */
+let busySince = 0, busyText = "", busyTick = null;
+function paintStatus() {
+  document.getElementById("status").textContent =
+    busyText + " … " + Math.floor((Date.now() - busySince) / 1000) + " s";
+}
+function busy(text) {
+  busyText = text;
+  if (!busySince) {
+    busySince = Date.now();
+    document.getElementById("controls").disabled = true;
+    busyTick = setInterval(paintStatus, 500);
+  }
+  paintStatus();
+}
+function idle(msg) {
+  clearInterval(busyTick);
+  busySince = 0;
+  document.getElementById("controls").disabled = false;
+  document.getElementById("status").textContent = msg || "";
+}
+// Runs an async job with the controls locked; errors are shown in the status line.
+async function run(label, fn) {
+  busy(label);
+  const t0 = Date.now();
+  try {
+    await fn();
+    idle("Done in " + ((Date.now() - t0) / 1000).toFixed(1) + " s");
+  } catch (err) {
+    idle("Error: " + err.message);
+  }
+}
+
+function saveBlob(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+
+let files = [];        // {name, sheetNames, sheet, headers}
 let columns = [];      // [{key, display}]
 let included = {};     // key -> bool
-let combined = null;   // {rows, total, colCount}
+let combined = null;   // {total, dupes, colCount}
 
 const $ = id => document.getElementById(id);
 
@@ -104,28 +656,60 @@ function isEmptyHeader(h) {
 }
 
 // ---- File loading -----------------------------------------------------------
-$("files").addEventListener("change", async e => {
+$("files").addEventListener("change", e => {
+  const list = Array.from(e.target.files);
   files = [];
   clearLog();
-  const list = Array.from(e.target.files);
-  for (const file of list) {
-    try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array", cellDates: true });
-      files.push({ name: file.name, wb, sheetNames: wb.SheetNames, sheet: wb.SheetNames[0] });
-      log("Loaded: " + file.name + "  [sheets: " + wb.SheetNames.join(", ") + "]");
-    } catch (err) {
-      log("FAILED: " + file.name + " — " + err.message);
-    }
-  }
   renderFileList();
   rescan();
+  if (!list.length) return;
+  run("Reading files", async () => {
+    await engine.call("reset");
+    let doneCount = 0;
+    const label = () => busy("Reading " + list.length + " file(s)" +
+      (engine.usePool(list.length) ? ", up to " + Math.min(engine.poolSize, list.length) + " at a time" : "") +
+      " — " + doneCount + " done");
+    label();
+    const results = await engine.parallel(list.map((file, index) => async worker => {
+      try { return await loadSheet(worker, file, index, null); }
+      catch (err) { return { error: err.message }; }
+      finally { doneCount++; label(); }
+    }));
+    results.forEach((r, index) => {
+      const file = list[index];
+      if (r.error) { log("FAILED: " + file.name + " — " + r.error); return; }
+      files.push({ file, name: file.name, index, sheetNames: r.sheetNames, sheet: r.sheet, headers: [], rowCount: r.rowCount });
+      log("Loaded: " + file.name + "  [sheets: " + r.sheetNames.join(", ") + "]  " + r.rowCount.toLocaleString() + " rows");
+    });
+    await refreshHeaders();
+    renderFileList();
+    rescan();
+  });
 });
+
+// A pool worker parses the file and its rows go straight to the main worker (never through the page).
+// Without a pool worker the main worker parses it itself.
+async function loadSheet(worker, file, index, sheet) {
+  const buf = await file.arrayBuffer();
+  if (!worker) return engine.call("parseFile", { buf, index, name: file.name, sheet }, null, [buf]);
+  const ch = new MessageChannel();
+  const received = engine.call("receiveFile", { index, name: file.name, port: ch.port1 }, null, [ch.port1]);
+  received.catch(() => {});
+  const r = await worker.call("parseFile", { buf, name: file.name, sheet, port: ch.port2 }, null, [buf, ch.port2]);
+  await received;
+  return r;
+}
+
+async function refreshHeaders() {
+  if (!files.length) return;
+  const all = await engine.call("headers", { headerIdx: headerRowIdx() });
+  files.forEach(f => { f.headers = all[f.index] || []; });
+}
 
 function renderFileList() {
   const c = $("fileList");
   c.innerHTML = "";
-  files.forEach((f, i) => {
+  files.forEach(f => {
     const div = document.createElement("div");
     div.className = "filerow";
     const label = document.createElement("span");
@@ -137,24 +721,30 @@ function renderFileList() {
       if (sn === f.sheet) o.selected = true;
       sel.appendChild(o);
     });
-    sel.addEventListener("change", () => { files[i].sheet = sel.value; rescan(); });
+    sel.addEventListener("change", () => run("Reading " + f.name + " (" + sel.value + ")", async () => {
+      try {
+        const [r] = await engine.parallel([w => loadSheet(w, f.file, f.index, sel.value)]);
+        f.sheet = r.sheet; f.rowCount = r.rowCount;
+        await refreshHeaders();
+        rescan();
+      } finally {
+        renderFileList();
+      }
+    }));
+    const count = document.createElement("span");
+    count.className = "muted";
+    count.textContent = "  " + f.rowCount.toLocaleString() + " rows";
     div.appendChild(label);
     div.appendChild(sel);
+    div.appendChild(count);
     c.appendChild(div);
   });
 }
 
 // ---- Header scan / column union --------------------------------------------
-function getAoA(f) {
-  const ws = f.wb.Sheets[f.sheet];
-  if (!ws) return [];
-  return XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
-}
-
-function fileKeyIndex(aoa) {
-  const headers = aoa[headerRowIdx()] || [];
+function fileKeyIndex(f) {
   const idx = {};
-  headers.forEach((h, i) => {
+  (f.headers || []).forEach((h, i) => {
     if (isEmptyHeader(h)) return;
     const k = normKey(h);
     if (!(k in idx)) idx[k] = i; // first occurrence wins on duplicate headers
@@ -167,9 +757,7 @@ function rescan() {
   const map = new Map();
   const order = [];
   files.forEach(f => {
-    const aoa = getAoA(f);
-    const headers = aoa[headerRowIdx()] || [];
-    headers.forEach(h => {
+    (f.headers || []).forEach(h => {
       if (isEmptyHeader(h)) return;
       const k = normKey(h);
       if (!map.has(k)) {
@@ -196,11 +784,15 @@ function rescan() {
 function renderColumns() {
   const c = $("colList");
   c.innerHTML = "";
-  if (!columns.length) { c.textContent = "(no headers found — check the header row number)"; return; }
+  if (!columns.length) {
+    c.textContent = files.length ? "(no headers found — check the header row number)" : "(load files first)";
+    renderDedupeCols();
+    return;
+  }
 
   // per-file missing report
   const perFileMissing = files.map(f => {
-    const idx = fileKeyIndex(getAoA(f));
+    const idx = fileKeyIndex(f);
     const missing = columns.filter(col => !(col.key in idx)).map(col => col.display);
     return { name: f.name, missing };
   });
@@ -225,11 +817,13 @@ function renderColumns() {
     note.style.marginTop = "8px";
     note.innerHTML = "<b>Columns missing per file</b> (blank in output — watch for header typos):<br>" +
       perFileMissing.filter(f => f.missing.length)
-        .map(f => "&nbsp;&nbsp;" + f.name + ": " + f.missing.join(", "))
+        .map(f => "&nbsp;&nbsp;" + escapeHtml(f.name) + ": " + escapeHtml(f.missing.join(", ")))
         .join("<br>");
     c.appendChild(note);
   }
 }
+
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // ---- Duplicates -------------------------------------------------------------
 function invalidate() { combined = null; $("downloadBtn").disabled = true; }
@@ -249,66 +843,39 @@ function renderDedupeCols() {
   sel.disabled = dedupeMode() !== "column" || !sel.options.length;
 }
 
-// Comparable form of a cell value
-function cellKey(v) {
-  if (v === null || v === undefined) return "";
-  let s = v instanceof Date ? v.toISOString() : String(v);
-  if ($("dedupeLoose").checked) s = s.replace(/\s+/g, " ").trim().toLowerCase();
-  return s;
-}
-
 // ---- Combine ----------------------------------------------------------------
-function combine() {
+$("combineBtn").addEventListener("click", () => {
+  if (!files.length) return;
   const cols = columns.filter(c => included[c.key]);
   const outHeaders = [];
   if (addSourceOn()) outHeaders.push("Source File");
   cols.forEach(c => outHeaders.push(c.display));
 
-  const rows = [outHeaders];
-  let total = 0, dupes = 0;
-
   const mode = dedupeMode();
   const dcol = mode === "column" ? cols.findIndex(c => c.key === $("dedupeCol").value) : -1;
   if (mode === "column" && dcol < 0) log("Duplicate check skipped: no column selected.");
-  const seen = new Set();
 
+  // per file: output column -> source column index (-1 = missing)
+  const plans = [];
   files.forEach(f => {
-    const aoa = getAoA(f);
-    const idx = fileKeyIndex(aoa);
-    const dataRows = aoa.slice(headerRowIdx() + 1);
-    dataRows.forEach(dr => {
-      if (!dr || dr.every(v => v === null || v === undefined || v === "")) return; // skip empty
-      const data = cols.map(c => {
-        const i = idx[c.key];
-        return i === undefined ? null : (dr[i] === undefined ? null : dr[i]);
-      });
-
-      // duplicate check on data columns only (Source File excluded)
-      let k = null;
-      if (mode === "rows") k = JSON.stringify(data.map(cellKey));
-      else if (dcol >= 0) { k = cellKey(data[dcol]); if (k === "") k = null; }
-      if (k !== null) {
-        if (seen.has(k)) { dupes++; return; }
-        seen.add(k);
-      }
-
-      rows.push(addSourceOn() ? [f.name, ...data] : data);
-      total++;
-    });
+    const idx = fileKeyIndex(f);
+    plans[f.index] = cols.map(c => (c.key in idx ? idx[c.key] : -1));
   });
 
-  return { rows, total, dupes, colCount: outHeaders.length };
-}
-
-$("combineBtn").addEventListener("click", () => {
-  if (typeof XLSX === "undefined") { log("XLSX library failed to load (network?)."); return; }
-  if (!files.length) return;
-  combined = combine();
-  $("summary").textContent =
-    "Files: " + files.length + "   Data rows: " + combined.total + "   Columns: " + combined.colCount +
-    (dedupeMode() !== "none" ? "   Duplicates removed: " + combined.dupes : "");
-  renderPreview(combined.rows);
-  $("downloadBtn").disabled = combined.total === 0;
+  run("Combining", async () => {
+    const r = await engine.call("combine", {
+      plans, headerIdx: headerRowIdx(), addSource: addSourceOn(), outHeaders,
+      dedupe: { mode: dcol >= 0 || mode === "rows" ? mode : "none", col: dcol, loose: $("dedupeLoose").checked }
+    }, busy);
+    combined = { total: r.total, dupes: r.dupes, colCount: outHeaders.length };
+    const sheetsNeeded = Math.ceil(r.total / EXCEL_MAX_DATA_ROWS);
+    $("summary").textContent =
+      "Files: " + files.length + "   Data rows: " + r.total.toLocaleString() + "   Columns: " + combined.colCount +
+      (mode !== "none" ? "   Duplicates removed: " + r.dupes.toLocaleString() : "") +
+      (sheetsNeeded > 1 ? "   (over Excel's row limit: the download will be split across " + sheetsNeeded + " sheets)" : "");
+    renderPreview([outHeaders].concat(r.preview));
+    $("downloadBtn").disabled = r.total === 0;
+  });
 });
 
 function fmtCell(v) {
@@ -322,8 +889,7 @@ function renderPreview(rows) {
   c.innerHTML = "";
   const table = document.createElement("table");
   table.className = "preview";
-  const show = rows.slice(0, 51); // header + 50
-  show.forEach((r, ri) => {
+  rows.forEach((r, ri) => {
     const tr = document.createElement("tr");
     r.forEach(v => {
       const cell = document.createElement(ri === 0 ? "th" : "td");
@@ -337,17 +903,20 @@ function renderPreview(rows) {
 
 // ---- Download ---------------------------------------------------------------
 $("downloadBtn").addEventListener("click", () => {
-  if (!combined || !combined.rows.length) return;
-  const ws = XLSX.utils.aoa_to_sheet(combined.rows, { cellDates: true });
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Combined");
+  if (!combined || !combined.total) return;
   let name = ($("outName").value || "combined.xlsx").trim();
   if (!/\.xlsx$/i.test(name)) name += ".xlsx";
-  XLSX.writeFile(wb, name);
+  run("Writing " + name, async () => {
+    const blob = await engine.call("download", {}, busy);
+    saveBlob(blob, name);
+  });
 });
 
 // react to option changes
-["headerRow", "normalize", "addSource"].forEach(id =>
+$("headerRow").addEventListener("change", () => {
+  if (files.length) run("Reading headers", async () => { await refreshHeaders(); rescan(); });
+});
+["normalize", "addSource"].forEach(id =>
   $(id).addEventListener("change", () => { if (files.length) rescan(); })
 );
 document.querySelectorAll('input[name="dedupe"]').forEach(r =>
